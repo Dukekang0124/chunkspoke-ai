@@ -1,0 +1,23 @@
+name = "chunkspoke-ai"
+main = "src/worker.js"
+compatibility_date = "2025-06-01"
+account_id = "d24caa86ff464fd98e1c95a11c814a61"
+
+# 浏览器端（Web/小程序）来源白名单；原生 App 不带 Origin，一律放行（见 worker.js）。
+# 如需在 Web 端调用，把下面的来源填进去，例如 "https://app.chunkspoke.com"。
+# [vars]
+# ALLOWED_ORIGINS = "https://app.chunkspoke.com,https://chunkspoke.com"
+
+[vars]
+# App 与后端之间的共享令牌，需与 Android 端保持一致（通过 --dart-define=AI_APP_TOKEN 注入真实值）。
+# 这是「应用级令牌」，不是任何大模型密钥，泄露风险低；真实值请用 dart-define 注入，不要提交到 git。
+APP_TOKEN = "chunkspoke_2026_secure_token_change_me"
+# 每日总调用配额（KV 按日期计数，超了返回 429）。
+DAILY_QUOTA = "500"
+
+[[kv_namespaces]]
+binding = "DAILY_STATS"
+id = "3cc79d550f524652a36494159e3dcf91"   # 已创建：wrangler kv namespace create "DAILY_STATS"
+
+# ⚠️ ZHIPU_API_KEY 绝不可写进本文件或任何源码！
+# 用 `wrangler secret put ZHIPU_API_KEY` 设置，Cloudflare 会以 env.ZHIPU_API_KEY 注入。

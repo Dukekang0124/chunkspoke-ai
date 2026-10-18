@@ -1,0 +1,8 @@
+# Cloudflare Wrangler 本地状态（含缓存/日志，不提交）
+.wrangler/
+
+# 本地密钥文件（绝不提交；真实密钥只进 Cloudflare Secret / API）
+.dev.vars
+
+# Node 依赖
+node_modules/
