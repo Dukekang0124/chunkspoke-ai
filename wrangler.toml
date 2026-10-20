@@ -9,10 +9,13 @@ account_id = "d24caa86ff464fd98e1c95a11c814a61"
 # ALLOWED_ORIGINS = "https://app.chunkspoke.com,https://chunkspoke.com"
 
 [vars]
-# App 与后端之间的共享令牌，需与 Android 端保持一致（通过 --dart-define=AI_APP_TOKEN 注入真实值）。
-# 这是「应用级令牌」，不是任何大模型密钥，泄露风险低；真实值请用 dart-define 注入，不要提交到 git。
+# 应用级令牌：只用来区分「是不是本 App 的调用」，不是安全边界——它必然随 APK 公开，
+# 拿到 APK 就能提取。真正的防线是下面的两层配额（按 IP + 全局）。
+# 若将来要接入计费或对外开放 API，再把它换成需签名的短期凭证，别指望混淆。
 APP_TOKEN = "chunkspoke_2026_secure_token_change_me"
-# 每日总调用配额（KV 按日期计数，超了返回 429）。
+# 单 IP 每日调用上限（先查它，避免一个人把全局额度吃光 = 对所有用户 DoS）。
+PER_IP_QUOTA = "40"
+# 全站每日总调用上限（KV 按日期计数，超了返回 429）。
 DAILY_QUOTA = "500"
 
 [[kv_namespaces]]

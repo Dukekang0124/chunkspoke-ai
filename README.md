@@ -38,16 +38,21 @@ wrangler deploy                                   # 记下输出的 Worker URL
 ```
 部署后把 Worker URL 与 APP_TOKEN 注入到 Flutter 构建（见下）。
 
-## Flutter 端配置（baseUrl / appToken 不硬编码）
-通过编译期 `--dart-define` 注入（推荐）：
+## Flutter 端配置（baseUrl / appToken 注入）
+通过编译期 `--dart-define` 注入：
 ```bash
 flutter build apk --release --split-per-abi \
   --dart-define=AI_BASE_URL=https://chunkspoke-ai.pages.dev \
   --dart-define=AI_APP_TOKEN=chunkspoke_2026_secure_token_change_me
 ```
+> 关于这个 token 的定位，说清楚以免误导后来人：它是**应用识别符，不是秘密**。任何拿到 APK
+> 的人都能从二进制里提取它，`ai_service.dart` 的 `_kDefaultAppToken` 默认值就是线上生效值，
+> 并且连同部署命令一起提交在公开仓库里。所以防滥用靠的是**两层配额**（按 IP + 全局），
+> 不是靠 token 保密。若将来要对外开放 API 或接入计费，请换成服务端签发的短期凭证，
+> 别在混淆上自欺。
+
 若想用 `android/local.properties`（gradle）驱动，可在 `android/app/build.properties` 写法里读取后在
-`android/app/build.gradle` 透传为 `dartDefines`（团队已有先例）；默认值在
-`lib/services/ai/ai_service.dart` 的 `_kDefaultBaseUrl` / `_kDefaultAppToken` 仅作占位。
+`android/app/build.gradle` 透传为 `dartDefines`（团队已有先例）。
 
 ## 验收清单
 
@@ -59,13 +64,18 @@ flutter build apk --release --split-per-abi \
 | 周报 | 发 `weekly_report` | 返回中文周报（data.content） |
 | 错因分析 | 发 `error_analysis` | 返回具体建议 |
 | 造句评判 | 发 `free_build_judge` | 返回可解析 JSON（score/feedback/corrected） |
-| 限额 | 把 `DAILY_QUOTA` 改成 1，请求两次 | 第二次 429 |
+| 单 IP 限额 | 同一出口 IP 连续请求超过 `PER_IP_QUOTA`（默认 40/天） | 第 41 次起返回 429，文案提示可在设置里关掉联网点评 |
+| 全局上限 | 把 `DAILY_QUOTA` 改成 1，请求两次 | 第二次 429；它只是总额保险丝，不再能被单个人吃光 |
+| 体积上限 | 发一个 >8192 字符的 body | 返回 413，不会转发给智谱 |
+| 未知 action | 发 `{"action":"nope"}` | 返回 400（旧版返回 200，会让监控误判成功） |
 | 降级 | 断网 / 填错 ZHIPU_API_KEY | App 显示降级文案，不崩溃不弹原始错误 |
 | Key 安全 | 全局搜索 `sk-` | 代码中无任何真实 Key |
 
 ## 设计要点
 - **离线优先降级**：自由造句在客户端先尝试云端 AI 评判；失败 / 无网络时自动回退到 App 内置的离线规则引擎（见 `lib/screens/free_build_screen.dart`），绝不阻断用户开口。
 - **节流（调用方负责）**：`error_analysis` 仅在「同一句连续错 2 次」时调用；`weekly_report` 每天只请求一次（客户端按日期缓存）。
-- **限流（后端负责）**：KV 按 `quota:YYYY-MM-DD` 计数，TTL 86400，超限 429。
+- **限流（后端负责）**：两层 KV 计数器——`quota:ip:YYYY-MM-DD:<ip>` 限单来源（`PER_IP_QUOTA`），
+  `quota:day:YYYY-MM-DD` 限全站总额（`DAILY_QUOTA`），TTL 90000s，超限 429。计数器 get+put 非原子，
+  高并发下会少量低估；本用途是挡滥用，不是计费，可接受。
 - **免费模型兜底**：智谱 `glm-4-flash` 并发低，所有调用带 15s 超时 + 2 次重试。
 - **人话降级**：任何异常（网络 / Key 失效 / 超配额 / 解析失败）都返回中文 fallback，绝不让客户端弹原始错误。

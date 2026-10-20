@@ -26,19 +26,36 @@ function shouldAllowOrigin(req) {
 }
 
 // ───────────────────────── 配额（KV） ─────────────────────────
-async function checkQuota(env) {
-  const day = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
-  const key = `quota:${day}`;
+// 客户端令牌是「应用识别符」，不是秘密（它必然随 APK 一起公开），所以真正的防线是配额。
+// 旧实现只有一把全局计数器：任何人拿公开令牌刷一天就能把全站额度烧光，对所有真实
+// 用户等于 DoS。这里拆成「按 IP 日限」+「全局上限」两层，先查单 IP，避免一人吃光全局。
+function clientIp(req) {
+  const ip = req.headers.get('CF-Connecting-IP')
+    || req.headers.get('X-Forwarded-For')?.split(',')[0]?.trim();
+  if (ip) return ip;
+  return `ua:${(req.headers.get('User-Agent') || 'none').slice(0, 64)}`;
+}
+
+async function bump(env, key, limit) {
   let count = 0;
   try {
     count = parseInt((await env.DAILY_STATS.get(key)) || '0', 10) || 0;
   } catch (_) {}
-  const quota = parseInt(env.DAILY_QUOTA || '500', 10) || 500;
-  if (count >= quota) return false;
+  if (count >= limit) return false;
   try {
-    await env.DAILY_STATS.put(key, String(count + 1), { expirationTtl: 86400 });
+    // get+put 非原子，高并发下会少量低估；本场景是挡滥用而非计费，可接受。
+    await env.DAILY_STATS.put(key, String(count + 1), { expirationTtl: 90000 });
   } catch (_) {}
   return true;
+}
+
+async function checkQuota(env, ip) {
+  const day = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+  const perIp = parseInt(env.PER_IP_QUOTA || '40', 10) || 40;
+  const globalLimit = parseInt(env.DAILY_QUOTA || '500', 10) || 500;
+  if (!(await bump(env, `quota:ip:${day}:${ip}`, perIp))) return { ok: false, scope: 'ip' };
+  if (!(await bump(env, `quota:day:${day}`, globalLimit))) return { ok: false, scope: 'global' };
+  return { ok: true };
 }
 
 // ───────────────────────── 智谱调用（超时 + 重试） ─────────────────────────
@@ -153,6 +170,48 @@ function parseJsonSafe(s) {
   }
 }
 
+// ───────────────────────── 入参约束 ─────────────────────────
+// 不校验的话，undefined 会被拼成字面量 "undefined" 喂给模型；超长文本则直接烧钱。
+const MAX_BODY_CHARS = 8192;
+const MAX_TEXT = 300;
+const MAX_CHUNKS = 40;
+
+const clip = (v, n = MAX_TEXT) => String(v ?? '').slice(0, n);
+const num = (v) => {
+  const x = Number(v);
+  return Number.isFinite(x) ? Math.max(0, Math.min(1e6, Math.round(x))) : 0;
+};
+
+function sanitizeUserData(u) {
+  return {
+    totalChunks: num(u?.totalChunks),
+    practiceDays: num(u?.practiceDays),
+    completedScenarios: num(u?.completedScenarios),
+    weakChunks: Array.isArray(u?.weakChunks) ? u.weakChunks.slice(0, 20).map((s) => clip(s, 60)) : [],
+    freeBuildCount: num(u?.freeBuildCount),
+    streakDays: num(u?.streakDays),
+  };
+}
+
+function sanitizeErrorData(e) {
+  return {
+    scenario: clip(e?.scenario, 80),
+    targetSentence: clip(e?.targetSentence),
+    userSpeech: clip(e?.userSpeech),
+  };
+}
+
+function sanitizeBuildData(b) {
+  return {
+    scenario: clip(b?.scenario, 80),
+    chinesePrompt: clip(b?.chinesePrompt),
+    availableChunks: Array.isArray(b?.availableChunks)
+      ? b.availableChunks.slice(0, MAX_CHUNKS).map((s) => clip(s, 80))
+      : [],
+    userSpeech: clip(b?.userSpeech),
+  };
+}
+
 // ───────────────────────── 统一错误响应 ─────────────────────────
 function jsonResp(obj, status, req) {
   return new Response(JSON.stringify(obj), {
@@ -188,28 +247,40 @@ export default {
         req
       );
     }
-    // 5) 配额
-    let quotaOk = true;
+    // 5) 体积上限：不限的话一个请求就能把几万字塞进智谱，按 token 计费直接爆。
+    const raw = await req.text();
+    if (raw.length > MAX_BODY_CHARS) {
+      return jsonResp({ success: false, error: 'payload_too_large', fallback: '内容过长，请稍后再试' }, 413, req);
+    }
+    // 6) 配额（按 IP + 全局两层）
+    let quota = { ok: true };
     try {
-      quotaOk = await checkQuota(env);
+      quota = await checkQuota(env, clientIp(req));
     } catch (_) {}
-    if (!quotaOk) {
+    if (!quota.ok) {
       return jsonResp(
-        { success: false, error: 'quota_exceeded', fallback: '今日 AI 次数已用完，明天再来吧' },
+        {
+          success: false,
+          error: 'quota_exceeded',
+          fallback: quota.scope === 'ip'
+            ? '今天的 AI 点评次数用完了，明天再来（可在设置里关掉联网点评，用本机判定）'
+            : '今日 AI 次数已用完，明天再来吧',
+        },
         429,
         req
       );
     }
-    // 6) 路由
+    // 7) 路由
     try {
-      const payload = await req.json().catch(() => null);
+      const payload = JSON.parse(raw || 'null');
       const action = payload?.action;
       let data;
-      if (action === 'weekly_report') data = await handleWeekly(payload.userData, env);
-      else if (action === 'error_analysis') data = await handleError(payload.errorData, env);
-      else if (action === 'free_build_judge') data = await handleJudge(payload.buildData, env);
+      if (action === 'weekly_report') data = await handleWeekly(sanitizeUserData(payload.userData), env);
+      else if (action === 'error_analysis') data = await handleError(sanitizeErrorData(payload.errorData), env);
+      else if (action === 'free_build_judge') data = await handleJudge(sanitizeBuildData(payload.buildData), env);
       else {
-        return jsonResp({ success: false, error: 'unknown_action', fallback: '暂不支持该操作' }, 200, req);
+        // 未知 action 属于调用方错误，过去返回 200 会让监控和客户端都误判成成功。
+        return jsonResp({ success: false, error: 'unknown_action', fallback: '暂不支持该操作' }, 400, req);
       }
       return jsonResp({ success: true, data }, 200, req);
     } catch (e) {
